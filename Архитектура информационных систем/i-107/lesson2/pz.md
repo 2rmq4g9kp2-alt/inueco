@@ -10,6 +10,8 @@
 
 ## 6 <https://code-basics.com/ru/languages/python/lessons/basic>
 
+
+
 ## шаблон кода
 
 ## 1 Привет, Мир
