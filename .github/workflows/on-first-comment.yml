@@ -1,0 +1,231 @@
+name: Auto Assign and Move to In Progress
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if this is the first comment
+        id: first-comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const issue_number = context.payload.issue.number;
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+
+            const isFirst = comments.data.length === 1;
+
+            if (!isFirst) {
+              console.log("Not the first comment. Skipping auto-assign and status update.");
+            } else {
+              console.log("This is the first comment. Proceeding with assignment and status update.");
+            }
+
+            return isFirst;
+
+      - name: Check if blocked user
+        id: check-blocked
+        uses: actions/github-script@v7
+        if: steps.first-comment.outputs.result == 'true'
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const blockedUsers = [
+              "RooveThelema",
+              "Tema13cm",
+              "FunnySmailey",
+              "abobobba228"
+            ];
+
+            const commentUser = context.payload.comment.user.login;
+
+            if (blockedUsers.includes(commentUser)) {
+              console.log(`User ${commentUser} is blocked. Deleting comment...`);
+              
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+              });
+              
+              core.setFailed(`User ${commentUser} is blocked and their comment has been deleted.`);
+            } else {
+              console.log(`User ${commentUser} is allowed.`);
+            }
+
+      - name: Get project data and check if Blocked
+        id: get-item
+        if: steps.first-comment.outputs.result == 'true' && steps.check-blocked.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const issueNodeId = context.payload.issue.node_id;
+            const projectNumber = 3;
+            const userLogin = "tsenturion";
+
+            // Функция для получения данных проекта
+            async function getProjectData() {
+              const result = await github.graphql(`
+                query($userLogin: String!, $projectNumber: Int!) {
+                  user(login: $userLogin) {
+                    projectV2(number: $projectNumber) {
+                      id
+                      fields(first: 20) {
+                        nodes {
+                          ... on ProjectV2FieldCommon {
+                            id
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            options {
+                              id
+                              name
+                            }
+                          }
+                        }
+                      }
+                      items(first: 100) {
+                        nodes {
+                          id
+                          content {
+                            ... on Issue {
+                              id
+                            }
+                          }
+                          fieldValues(first: 20) {
+                            nodes {
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                field {
+                                  ... on ProjectV2FieldCommon {
+                                    name
+                                  }
+                                }
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `, { userLogin, projectNumber });
+              
+              return result.user.projectV2;
+            }
+
+            // Retry логика с экспоненциальной задержкой
+            let project, item;
+            const maxAttempts = 5;
+            const delays = [0, 1000, 2000, 4000, 8000]; // 0s, 1s, 2s, 4s, 8s = максимум 15s
+            
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              if (attempt > 0) {
+                console.log(`Attempt ${attempt + 1}/${maxAttempts}. Waiting ${delays[attempt]/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+              } else {
+                console.log(`Attempt ${attempt + 1}/${maxAttempts}. Checking immediately...`);
+              }
+              
+              project = await getProjectData();
+              item = project.items.nodes.find(n => n.content?.id === issueNodeId);
+              
+              if (item) {
+                console.log(`✓ Issue found in project on attempt ${attempt + 1}`);
+                break;
+              }
+              
+              console.log(`✗ Issue not found in project (attempt ${attempt + 1}/${maxAttempts})`);
+            }
+
+            if (!item) {
+              core.setFailed(
+                "Issue not found in project after multiple attempts.\n" +
+                "Please ensure the issue is added to Project #3 before commenting.\n" +
+                "You may need to manually add it or check project automation settings."
+              );
+              return;
+            }
+
+            const statusValue = item.fieldValues.nodes.find(fv => fv.field?.name === "Status");
+            const currentStatus = statusValue?.name ?? "Unspecified";
+            console.log(`Current issue status: ${currentStatus}`);
+
+            if (currentStatus === "Blocked") {
+              core.setFailed("This issue is Blocked and cannot be assigned.");
+              return;
+            }
+
+            const statusField = project.fields.nodes.find(f => f.name === "Status");
+            if (!statusField) {
+              core.setFailed("Status field not found.");
+              return;
+            }
+
+            const inProgressOption = statusField.options.find(opt => opt.name === "In Progress");
+            if (!inProgressOption) {
+              core.setFailed('"In Progress" option not found.');
+              return;
+            }
+
+            core.setOutput("projectData", JSON.stringify({
+              projectId: project.id,
+              itemId: item.id,
+              fieldId: statusField.id,
+              optionId: inProgressOption.id
+            }));
+
+      - name: Assign user who commented
+        if: steps.first-comment.outputs.result == 'true' && steps.check-blocked.outcome == 'success' && steps.get-item.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const issue_number = context.payload.issue.number;
+            const user = context.payload.comment.user.login;
+
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              assignees: [user],
+            });
+
+      - name: Set status to In Progress
+        if: steps.first-comment.outputs.result == 'true' && steps.check-blocked.outcome == 'success' && steps.get-item.outcome == 'success'
+        uses: actions/github-script@v7
+        env:
+          PROJECT_DATA: ${{ steps.get-item.outputs.projectData }}
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const data = JSON.parse(process.env.PROJECT_DATA);
+
+            await github.graphql(`
+              mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+                updateProjectV2ItemFieldValue(input: $input) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `, {
+              input: {
+                projectId: data.projectId,
+                itemId: data.itemId,
+                fieldId: data.fieldId,
+                value: {
+                  singleSelectOptionId: data.optionId
+                }
+              }
+            });
